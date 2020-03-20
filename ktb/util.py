@@ -118,9 +118,9 @@ def flattern_values(obj, func=None):
 def apply2values(obj, func):
     res = None
     if isinstance(obj, dict):
-        res = {k:apply2values(v) for k,v in obj.items}
+        res = {k:apply2values(v, func) for k,v in obj.items}
     elif isinstance(obj, list):
-        res = [apply2values(v) for v in obj]
+        res = [apply2values(v, func) for v in obj]
     else:
         res = func(obj)
     return res

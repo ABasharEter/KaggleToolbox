@@ -8,13 +8,14 @@ import re
 from annoy import AnnoyIndex
 from collections import defaultdict
 import unidecode
+from gensim.summarization.bm25 import BM25
 
 DEFAULT_REGEX = "[-,.\\/!@#$%^&*))_+=]"
 
 def tokenize(text, regex=DEFAULT_REGEX):
     if text is None or (not isinstance(text,str) and np.isnan(text)):
         return []
-    return [unidecode(x) for y in word_tokenize(str(text)) for x in re.split(regex, y)]
+    return [unidecode.unidecode(x).lower() for y in word_tokenize(str(text)) for x in re.split(regex, y)]
 
 lemmatizer = WordNetLemmatizer()
 stemmer = PorterStemmer()
@@ -31,7 +32,7 @@ def lemmatize_data(obj):
 def stem_data(obj):
     return apply2values(obj, stem)
 
-def reduce_w3v_size(data, model_file, tokenization_regex = DEFAULT_REGEX, use_lemmatizer = True, user_stemmer = False):
+def reduce_w3v_size(data, model_file, tokenization_regex = DEFAULT_REGEX, use_lemmatizer = True, use_stemmer = False):
     words_model = None
     data = set(flattern_values(data, lambda x: tokenize(x, tokenization_regex)))
     
@@ -44,7 +45,7 @@ def reduce_w3v_size(data, model_file, tokenization_regex = DEFAULT_REGEX, use_le
             word = lemmatize(word) 
             if word in words_model:
                 return words_model.word_vec(word) 
-        if user_stemmer:
+        if use_stemmer:
             word = stem(word)
             if word in words_model:
                 return words_model.word_vec(word) 
@@ -54,6 +55,17 @@ def reduce_w3v_size(data, model_file, tokenization_regex = DEFAULT_REGEX, use_le
     m = keyedvectors.Word2VecKeyedVectors(vector_size=words_model.vector_size)
     m.add(list(vecs.keys()), list(vecs.values()))
     return m
+
+def rank_items(scores, n_indexs, w = None, and_weight= 0.7):
+    items = []
+    for item, sc  in scores.items():
+        sc = [w[k] * v if w is not None and k in w else v for k,v in sc.items()]
+        score = min(sc) * (and_weight) + (1-and_weight) * (np.sum(sc) + (n_indexs -len(sc)) * max(sc))/n_indexs
+        items.append((item, score))
+    items = sorted(items, key = lambda x: x[1])
+    return items
+        
+
 
 class AnnoySearch:
     def __init__(self, w2v_model, columns, use_lemmatizer = True, use_stemmer= False):
@@ -69,8 +81,8 @@ class AnnoySearch:
             if self.use_lemmatizer:
                 word = lemmatize(word) 
                 if word in self.words_model:
-                    return self.ords_model.word_vec(word) 
-            if self.user_stemmer:
+                    return self.words_model.word_vec(word) 
+            if self.use_stemmer:
                 word = stem(word)
                 if word in self.words_model:
                     return self.words_model.word_vec(word) 
@@ -85,6 +97,7 @@ class AnnoySearch:
     def build(self, df, n_trees=1000):
         self.ids_index = df.index.to_list()
         self.ids = dict(zip(self.ids_index, range(len(df))))
+        self.df = df
         for c, idx in self.index.items():
             for i, row in df.iterrows():
                 idx.add_item(self.ids[i], self.get_vector(row[c]))
@@ -96,31 +109,64 @@ class AnnoySearch:
     def load(self):
         newObj =  read_object("annoy_search.gz")
         self.__dict__.update(newObj.__dict__)
-        
-    def query(self, q, n_items, w = None, and_weight= 0.7):
+    
+    def query(self, q, n_items, w = None, and_weight= 0.7, include_distances= False):
         q_vec = self.get_vector(q)
-        res_sum = dict()
-        res_min = dict()
-        count_dict = defaultdict(int)
+        score_dict = defaultdict(dict)
         for c, idx in self.index.items():
-            ids =  idx.get_nns_by_vector(q_vec, n_items, include_distances=True)
+            ids =  idx.get_nns_by_vector(q_vec, n_items, include_distances= True)
             for i, s in list(zip(list(ids[0]),list(ids[1]))):
-                s = s if w is None or c not in w else s * w[c]
-                if i in res_sum:
-                    res_sum[i] += s
-                    res_min[i] = max(res_min[i], s)
-                else:
-                    res_sum[i] = s
-                    res_min[i] = s
-                count_dict[i] += 1
-        res = dict()
-        for i in res_sum.keys():
-            res_sum[i] /= count_dict[i]
-            res[i] =  res_sum[i]*(1- and_weight) + res_min[i]*(and_weight)
-        res = sorted(res.keys(), key= lambda x: res[x])
-        res = [self.ids_index[i] for i in res]
-        return res
+                score_dict[i].update({c:s})
+        sorted_res = rank_items(score_dict, len(self.index), w, and_weight)
+        
+        if not include_distances:
+            sorted_res = [k for k,v in sorted_res]
+        return sorted_res
 
         
+class HybridSearch:
+    def __init__(self, w2v_model, columns, use_lemmatizer = True, use_stemmer= True, use_lemmatizer_annoy = True, use_stemmer_annoy= False):
+        self.use_lemmatizer = use_lemmatizer
+        self.use_stemmer = use_stemmer
+        self.annoy_search = AnnoySearch(w2v_model, columns, use_lemmatizer_annoy, use_lemmatizer_annoy)
+        self.bm25 = {c:None for c in columns}
 
+    def process_text(self, text):
+        text = tokenize(text)
+        if self.use_lemmatizer:
+            text = lemmatize_data(text)
+        if self.use_stemmer:
+            text = stem_data(text)
+        return text
+
+    def build(self, df, n_trees=1000):
+        for c in self.bm25.keys():
+            data = []
+            for i, row in df.iterrows():
+                data.append(self.process_text(row[c]))
+            self.bm25[c] = BM25(data)
+        self.annoy_search.build(df, n_trees)
+    
+    def save(self):
+        write_object("hybrid_search.gz", self)
         
+    def load(self):
+        newObj =  read_object("hybrid_search.gz")
+        self.__dict__.update(newObj.__dict__) 
+    
+    def query(self, q, n_items, w = None, and_weight= 0.7, include_distances=False, additive_semantic_weight = 0.1):
+        score_dict = defaultdict(dict)
+        q_tokens = self.process_text(q)
+        for c, idx in self.bm25.items():
+            scores =  idx.get_scores(q_tokens)
+            for i, s in zip(range(len(scores)), scores):
+                score_dict[i].update({c: -s})
+        sorted_res = rank_items(score_dict, len(self.bm25), w, and_weight)
+        bm25_dict = dict(sorted_res)
+        annoy_res = self.annoy_search.query(q, n_items, w, and_weight, True)
+        for item,score in annoy_res:
+             bm25_dict[item] = score*additive_semantic_weight + bm25_dict[item]*score
+        sorted_res = sorted(bm25_dict.items(), key = lambda x: x[1])
+        if not include_distances:
+            sorted_res = [k for k,v in sorted_res]
+        return sorted_res[:n_items]

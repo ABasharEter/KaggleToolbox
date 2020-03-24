@@ -10,6 +10,7 @@ from collections import defaultdict
 import unidecode
 from gensim.summarization.bm25 import BM25
 from nltk.corpus import stopwords
+from tqdm.notebook import tqdm
 
 DEFAULT_REGEX = "[-,.\\/!@#$%^&*))_+=\(|\)|:|,|;|\.|’|”|“|\?|%|>|<]+"
 
@@ -20,7 +21,7 @@ def tokenize(text, regex=DEFAULT_REGEX):
         return []
     return [x for y in word_tokenize(str(text)) for x in re.split(regex, y)]
 
-def analyze(tokesn):
+def analyze(tokens):
     tokens = [unidecode.unidecode(t).lower() for t in tokens 
         if len(t) > 1 and t not in stopwords_en and (not t.isnumeric() or t.isalpha())]
     return tokens
@@ -43,7 +44,7 @@ def stem_data(obj):
 
 def reduce_w3v_size(data, model_file, tokenization_regex = DEFAULT_REGEX, use_lemmatizer = True, use_stemmer = False):
     words_model = None
-    data = set(flattern_values(data, lambda x: analyze(x, tokenization_regex)))
+    data = set(flattern_values(data, lambda x: analyze(tokenize(x, tokenization_regex))))
     
     with open(model_file, 'rb') as fin:
         words_model = KeyedVectors.load_word2vec_format(fin, binary=True)
@@ -97,7 +98,7 @@ class AnnoySearch:
                     return self.words_model.word_vec(word) 
             return self.words_model.word_vec("unk")
         
-        text = analyze(text)
+        text = analyze(tokenize(text))
         if len(text) == 0:
             text = ["unk"]
         vector = np.mean([get_vec(w) for w in text] ,axis=0)
@@ -107,9 +108,10 @@ class AnnoySearch:
         self.ids_index = df.index.to_list()
         self.ids = dict(zip(self.ids_index, range(len(df))))
         self.df = df
-        for c, idx in self.index.items():
-            for i, row in df.iterrows():
+        for i, row in tqdm(df.iterrows(), total = len(df)):
+            for c, idx in self.index.items():
                 idx.add_item(self.ids[i], self.get_vector(row[c]))
+        for c, idx in self.index.items():
             idx.build(n_trees)
         
     def save(self):
@@ -141,7 +143,7 @@ class HybridSearch:
         self.bm25 = {c:None for c in columns}
 
     def process_text(self, text):
-        text = analyze(text)
+        text = analyze(tokenize(text))
         if self.use_lemmatizer:
             text = lemmatize_data(text)
         if self.use_stemmer:
@@ -149,11 +151,8 @@ class HybridSearch:
         return text
 
     def build(self, df, n_trees=1000):
-        for c in self.bm25.keys():
-            data = []
-            for i, row in df.iterrows():
-                data.append(self.process_text(row[c]))
-            self.bm25[c] = BM25(data)
+        for c in tqdm(self.bm25.keys()):
+            self.bm25[c] = BM25(df[c].transform(self.process_text).to_list())
         self.annoy_search.build(df, n_trees)
     
     def save(self):

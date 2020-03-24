@@ -9,13 +9,22 @@ from annoy import AnnoyIndex
 from collections import defaultdict
 import unidecode
 from gensim.summarization.bm25 import BM25
+from nltk.corpus import stopwords
 
-DEFAULT_REGEX = "[-,.\\/!@#$%^&*))_+=]"
+DEFAULT_REGEX = "[-,.\\/!@#$%^&*))_+=\(|\)|:|,|;|\.|’|”|“|\?|%|>|<]+"
+
+stopwords_en = set(stopwords.words('english'))
 
 def tokenize(text, regex=DEFAULT_REGEX):
     if text is None or (not isinstance(text,str) and np.isnan(text)):
         return []
-    return [unidecode.unidecode(x).lower() for y in word_tokenize(str(text)) for x in re.split(regex, y)]
+    return [x for y in word_tokenize(str(text)) for x in re.split(regex, y)]
+
+def analyze(tokesn):
+    tokens = [unidecode.unidecode(t).lower() for t in tokens 
+        if len(t) > 1 and t not in stopwords_en and (not t.isnumeric() or t.isalpha())]
+    return tokens
+   
 
 lemmatizer = WordNetLemmatizer()
 stemmer = PorterStemmer()
@@ -34,7 +43,7 @@ def stem_data(obj):
 
 def reduce_w3v_size(data, model_file, tokenization_regex = DEFAULT_REGEX, use_lemmatizer = True, use_stemmer = False):
     words_model = None
-    data = set(flattern_values(data, lambda x: tokenize(x, tokenization_regex)))
+    data = set(flattern_values(data, lambda x: analyze(x, tokenization_regex)))
     
     with open(model_file, 'rb') as fin:
         words_model = KeyedVectors.load_word2vec_format(fin, binary=True)
@@ -88,7 +97,7 @@ class AnnoySearch:
                     return self.words_model.word_vec(word) 
             return self.words_model.word_vec("unk")
         
-        text = tokenize(text)
+        text = analyze(text)
         if len(text) == 0:
             text = ["unk"]
         vector = np.mean([get_vec(w) for w in text] ,axis=0)
@@ -132,7 +141,7 @@ class HybridSearch:
         self.bm25 = {c:None for c in columns}
 
     def process_text(self, text):
-        text = tokenize(text)
+        text = analyze(text)
         if self.use_lemmatizer:
             text = lemmatize_data(text)
         if self.use_stemmer:
@@ -167,6 +176,7 @@ class HybridSearch:
         for item,score in annoy_res:
              bm25_dict[item] = score*additive_semantic_weight + bm25_dict[item]*score
         sorted_res = sorted(bm25_dict.items(), key = lambda x: x[1])
-        if not include_distances:
-            sorted_res = [k for k,v in sorted_res]
-        return sorted_res[:n_items]
+        results = self.annoy_search.df.iloc[[idx for idx,_ in sorted_res]][list(self.bm25.keys())]
+        if include_distances:
+            results["Score"] = [score for _,score in sorted_res]
+        return results[:n_items]
